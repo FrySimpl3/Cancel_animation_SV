@@ -3,7 +3,7 @@
     <Platform Name="Any CPU" />
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="Cancel_animation.csproj">
+  <Project Path="Cancel_animation.csproj" Id="63031b65-5b7a-4dca-a6a8-69ec9f034399">
     <Platform Solution="*|x64" Project="x64" />
   </Project>
 </Solution>

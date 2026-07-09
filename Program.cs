@@ -72,7 +72,7 @@ class Program
         Application.Init();
         var top = Application.Top;
 
-        var win = new Window("STARDEW VALLEY ANIMATION CANCELER PRO - MONITOR DASHBOARD")
+        var win = new Window("STARDEW VALLEY ANIMATION CANCELER PRO - github.com/FrySimpl3/Cancel_animation_SV")
         {
             X = 0,
             Y = 0,
