@@ -1,16 +1,18 @@
-﻿using SharpHook;
-using SharpHook.Data;
-using SharpHook.Native;
-using System;
+﻿using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Terminal.Gui;
+using SharpHook;
+using SharpHook.Data;
+using SharpHook.Native;
 using WindowsInput;
 using WindowsInput.Native;
 
 class Program
 {
-    // Thêm các API Win32 để quản lý cửa sổ
+    // Win32 API quản lý cửa sổ hiển thị
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
@@ -24,14 +26,27 @@ class Program
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     private const int SW_RESTORE = 9;
+    private const string CONFIG_FILE = "config.txt";
 
+    // Biến điều khiển lõi Tool
     private static InputSimulator input = new InputSimulator();
     private static Random rand = new Random();
-
     private static bool _isLooping = false;
     private static readonly object lockObj = new object();
+    private static Thread actionThread = null;
+    private static SimpleGlobalHook hook = null;
 
-    // Thuộc tính quản lý trạng thái có thread-safe để cập nhật giao diện
+    // Toàn bộ cấu hình nạp từ file config.txt (Giá trị mặc định tối ưu nhất)
+    private static int cfgVirtualKeyCode = 32;
+    private static int cfgDelayClick = 12;
+    private static int cfgFramesSwing = 6;
+    private static int cfgDelayCombo = 25;
+    private static bool cfgEnableFocusCheck = true;
+    private static bool cfgEnableAutoFocus = true;
+
+    // Các thành phần giao diện Dashboard hiển thị thông tin tĩnh/động
+    private static Label lblStatusBadge = null;
+
     private static bool IsLooping
     {
         get { lock (lockObj) return _isLooping; }
@@ -42,134 +57,181 @@ class Program
                 if (_isLooping != value)
                 {
                     _isLooping = value;
-                    RenderStatus(); // Cập nhật lại giao diện ngay khi đổi trạng thái
+                    Application.MainLoop.Invoke(new Action(UpdateStatusUI));
                 }
             }
         }
     }
 
-    private static Thread actionThread;
-    private static KeyCode targetSharpHookKey = KeyCode.VcSpace;
-    private static string selectedKeyName = "SPACE";
-
     static void Main(string[] args)
     {
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
-        Console.Title = "Stardew Valley Animation Canceler Pro";
+        Console.SetWindowSize(104, 12);
+        // 1. Luôn tải cấu hình từ file trước
+        LoadConfig();
 
-        RenderHeader();
+        Application.Init();
+        var top = Application.Top;
 
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.Write(" ➜ Nhập phím kích hoạt (Ví dụ: Space, C, V, F...)\n ➜ Hoặc nhấn [ENTER] để dùng mặc định (Space): ");
-        Console.ResetColor();
-
-        string readLine = Console.ReadLine();
-        string inputKey = (readLine != null) ? readLine.Trim().ToUpper() : "";
-
-        if (string.IsNullOrEmpty(inputKey) || inputKey == "SPACE")
+        var win = new Window("STARDEW VALLEY ANIMATION CANCELER PRO - MONITOR DASHBOARD")
         {
-            targetSharpHookKey = KeyCode.VcSpace;
-            selectedKeyName = "SPACE";
-        }
-        else
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill()
+        };
+        top.Add(win);
+
+        // --- KHU VỰC 1: THÔNG TIN CẤU HÌNH ĐANG ĐƯỢC CHẠY ---
+        var frameConfigInfo = new FrameView(" Thông Số Đang Áp Dụng (Đọc từ config.txt) ")
         {
-            string enumName = "Vc" + inputKey;
-            try
-            {
-                targetSharpHookKey = (KeyCode)Enum.Parse(typeof(KeyCode), enumName, true);
-                selectedKeyName = inputKey;
-            }
-            catch
-            {
-                targetSharpHookKey = KeyCode.VcSpace;
-                selectedKeyName = "SPACE (Lỗi nhập, tự động quay về mặc định)";
-            }
+            X = 1,
+            Y = 1,
+            Width = Dim.Percent(55),
+            Height = 9
+        };
+
+        frameConfigInfo.Add(new Label("• Phím kích hoạt (VK Code) : " + cfgVirtualKeyCode + " (" + ((VirtualKeyCode)cfgVirtualKeyCode).ToString() + ")") { X = 1, Y = 1 });
+        frameConfigInfo.Add(new Label("• Delay sau Click chuột    : " + cfgDelayClick + " ms") { X = 1, Y = 2 });
+        frameConfigInfo.Add(new Label("• Chờ vung dụng cụ        : " + cfgFramesSwing + " frames") { X = 1, Y = 3 });
+        frameConfigInfo.Add(new Label("• Delay đè giữ Combo       : " + cfgDelayCombo + " ms") { X = 1, Y = 4 });
+        frameConfigInfo.Add(new Label("• Chống spam khi Alt+Tab   : " + (cfgEnableFocusCheck ? "BẬT [ON]" : "TẮT [OFF]")) { X = 1, Y = 5 });
+        frameConfigInfo.Add(new Label("• Tự động lôi game lên     : " + (cfgEnableAutoFocus ? "BẬT [ON]" : "TẮT [OFF]")) { X = 1, Y = 6 });
+
+        // --- KHU VỰC 2: GIÁM SÁT TRẠNG THÁI THỜI GIAN THỰC ---
+        var frameStatus = new FrameView(" Trạng Thái Hoạt Động ")
+        {
+            X = Pos.Right(frameConfigInfo) + 1,
+            Y = 1,
+            Width = Dim.Fill() - 1,
+            Height = 5
+        };
+
+        var lblStatusTitle = new Label("Trạng thái hiện tại: ") { X = 1, Y = 1 };
+        lblStatusBadge = new Label("  STOPPED (OFF)  ") { X = Pos.Right(lblStatusTitle), Y = 1 };
+        frameStatus.Add(lblStatusTitle, lblStatusBadge);
+
+        // --- KHU VỰC 3: HƯỚNG DẪN VÀ THOÁT ---
+        var frameHelp = new FrameView(" Hướng Dẫn Vận Hành ")
+        {
+            X = Pos.Right(frameConfigInfo) + 1,
+            Y = Pos.Bottom(frameStatus),
+            Width = Dim.Fill() - 1,
+            Height = 4
+        };
+        frameHelp.Add(new Label("➜ Đè giữ phím cấu hình để spam chặt/đào.\n➜ Bấm phím ESC để đóng hoàn toàn tool.") { X = 1, Y = 1 });
+
+        win.Add(frameConfigInfo, frameStatus, frameHelp);
+
+        UpdateStatusUI();
+
+        // Chạy luồng bắt phím nền SharpHook
+        Thread hookThread = new Thread(new ThreadStart(StartGlobalHook));
+        hookThread.IsBackground = true;
+        hookThread.Start();
+
+        Application.Run();
+
+        if (hook != null) hook.Dispose();
+    }
+
+    // Đọc file config.txt
+    private static void LoadConfig()
+    {
+        if (!File.Exists(CONFIG_FILE))
+        {
+            SaveConfig(); // Tự sinh file cấu hình tối ưu nếu chưa có
+            return;
         }
 
-        // Vẽ lại toàn bộ giao diện điều khiển sạch sẽ sau khi cấu hình xong
-        Console.Clear();
-        RenderHeader();
-        RenderStatus();
+        try
+        {
+            string[] lines = File.ReadAllLines(CONFIG_FILE);
+            foreach (string line in lines)
+            {
+                if (string.IsNullOrEmpty(line) || !line.Contains("=")) continue;
+                string[] parts = line.Split('=');
+                string key = parts[0].Trim();
+                string val = parts[1].Trim();
 
-        SimpleGlobalHook hook = new SimpleGlobalHook();
+                switch (key)
+                {
+                    case "VirtualKeyCode": cfgVirtualKeyCode = int.Parse(val); break;
+                    case "DelayClick": cfgDelayClick = int.Parse(val); break;
+                    case "FramesSwing": cfgFramesSwing = int.Parse(val); break;
+                    case "DelayCombo": cfgDelayCombo = int.Parse(val); break;
+                    case "EnableFocusCheck": cfgEnableFocusCheck = bool.Parse(val); break;
+                    case "EnableAutoFocus": cfgEnableAutoFocus = bool.Parse(val); break;
+                }
+            }
+        }
+        catch { }
+    }
+
+    // Ghi cấu hình mặc định (Gia tri TỐI ƯU NHẤT)
+    private static void SaveConfig()
+    {
+        try
+        {
+            using (StreamWriter sw = new StreamWriter(CONFIG_FILE, false))
+            {
+                sw.WriteLine("VirtualKeyCode=" + cfgVirtualKeyCode);
+                sw.WriteLine("DelayClick=" + cfgDelayClick);
+                sw.WriteLine("FramesSwing=" + cfgFramesSwing);
+                sw.WriteLine("DelayCombo=" + cfgDelayCombo);
+                sw.WriteLine("EnableFocusCheck=" + cfgEnableFocusCheck.ToString());
+                sw.WriteLine("EnableAutoFocus=" + cfgEnableAutoFocus.ToString());
+            }
+        }
+        catch { }
+    }
+
+    private static void StartGlobalHook()
+    {
+        hook = new SimpleGlobalHook();
         hook.KeyPressed += OnKeyPressed;
         hook.KeyReleased += OnKeyReleased;
-
         hook.Run();
     }
 
-    private static void RenderHeader()
+    private static void UpdateStatusUI()
     {
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("┌─────────────────────────────────────────────────────────────┐");
-        Console.Write("│");
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.Write("      STARDEW VALLEY - ANIMATION CANCELER (ULTRA FOCUS)      ");
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("│");
-        Console.WriteLine("└─────────────────────────────────────────────────────────────┘");
-        Console.ResetColor();
-    }
+        if (lblStatusBadge == null) return;
 
-    // Giao diện hiển thị trạng thái động (Style Claude tối giản, trực quan)
-    private static void RenderStatus()
-    {
-        // Lưu vị trí con trỏ hiện tại để tránh làm loạn console khi cập nhật liên tục
-        int currentLeft = Console.CursorLeft;
-        int currentTop = Console.CursorTop;
-
-        // Cố định vị trí vẽ bảng trạng thái ở dòng thứ 4
-        Console.SetCursorPosition(0, 4);
-
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine(" ───────────── CẤU HÌNH & TRẠNG THÁI HỆ THỐNG ─────────────");
-        Console.ResetColor();
-
-        Console.Write(" ❖ Phím kích hoạt hiện tại : ");
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"[{selectedKeyName}]");
-        Console.ResetColor();
-
-        Console.Write(" ❖ Trạng thái hoạt động    : ");
-        if (IsLooping)
+        if (_isLooping)
         {
-            Console.BackgroundColor = ConsoleColor.DarkGreen;
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.Write("  RUNNING (ON)  ");
+            lblStatusBadge.Text = "  RUNNING (ON)  ";
+            ColorScheme activeScheme = new ColorScheme();
+            activeScheme.Normal = Terminal.Gui.Attribute.Make(Color.White, Color.BrightGreen);
+            lblStatusBadge.ColorScheme = activeScheme;
         }
         else
         {
-            Console.BackgroundColor = ConsoleColor.DarkRed;
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.Write("  STOPPED (OFF) ");
+            lblStatusBadge.Text = "  STOPPED (OFF) ";
+            ColorScheme stopScheme = new ColorScheme();
+            stopScheme.Normal = Terminal.Gui.Attribute.Make(Color.White, Color.BrightRed);
+            lblStatusBadge.ColorScheme = stopScheme;
         }
-        Console.ResetColor();
-        Console.WriteLine("\n");
-
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine(" ─────────────────────────────────────────────────────────");
-        Console.ForegroundColor = ConsoleColor.Gray;
-        Console.WriteLine(" [Tính năng bảo vệ]: Tự động Focus game nếu game chạy ngầm.");
-        Console.WriteLine(" [An toàn]: Thả phím kích hoạt hoặc Alt+Tab sẽ ngắt cụm tool lập tức.");
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine(" ─────────────────────────────────────────────────────────");
-        Console.ResetColor();
-
-        // Trả con trỏ về vị trí cũ (nếu có nhập liệu sau này)
-        try { Console.SetCursorPosition(currentLeft, currentTop); } catch { }
     }
 
     private static void OnKeyPressed(object sender, KeyboardHookEventArgs e)
     {
-        if (e.Data.KeyCode == targetSharpHookKey)
+        int pressedVkCode = (int)e.Data.RawCode;
+
+        if (pressedVkCode == cfgVirtualKeyCode)
         {
-            // Kiểm tra và tự động lôi cửa sổ Stardew lên trước nếu nó đang chạy ngầm
-            if (!EnsureStardewValleyActive()) return;
+            if (cfgEnableAutoFocus)
+            {
+                if (!EnsureStardewValleyActive()) return;
+            }
+            else
+            {
+                if (cfgEnableFocusCheck && !IsStardewValleyActive()) return;
+            }
 
             if (!IsLooping)
             {
                 IsLooping = true;
-                actionThread = new Thread(DoAnimationCancel);
+                actionThread = new Thread(new ThreadStart(DoAnimationCancel));
                 actionThread.IsBackground = true;
                 actionThread.Start();
             }
@@ -178,7 +240,9 @@ class Program
 
     private static void OnKeyReleased(object sender, KeyboardHookEventArgs e)
     {
-        if (e.Data.KeyCode == targetSharpHookKey)
+        int releasedVkCode = (int)e.Data.RawCode;
+
+        if (releasedVkCode == cfgVirtualKeyCode)
         {
             IsLooping = false;
         }
@@ -188,7 +252,7 @@ class Program
     {
         while (IsLooping)
         {
-            if (!IsStardewValleyActive())
+            if (cfgEnableFocusCheck && !IsStardewValleyActive())
             {
                 IsLooping = false;
                 break;
@@ -199,12 +263,12 @@ class Program
             SleepForFrames(1);
             input.Mouse.LeftButtonUp();
 
-            Thread.Sleep(12 + rand.Next(0, 4));
+            Thread.Sleep(cfgDelayClick + rand.Next(0, 4));
 
             // --- 2. CHỜ VUNG DỤNG CỤ ---
-            SleepForFrames(6);
+            SleepForFrames(cfgFramesSwing);
 
-            if (!IsStardewValleyActive())
+            if (cfgEnableFocusCheck && !IsStardewValleyActive())
             {
                 IsLooping = false;
                 break;
@@ -215,7 +279,7 @@ class Program
             input.Keyboard.KeyDown(VirtualKeyCode.DELETE);
             input.Keyboard.KeyDown(VirtualKeyCode.RSHIFT);
 
-            Thread.Sleep(25);
+            Thread.Sleep(cfgDelayCombo);
 
             // --- 4. THẢ COMBO CANCEL ---
             input.Keyboard.KeyUp(VirtualKeyCode.VK_R);
@@ -251,12 +315,10 @@ class Program
         }
     }
 
-    // Hàm mới: Nếu Stardew Valley đang chạy nhưng không Active -> Ép nó hiện lên trước
     private static bool EnsureStardewValleyActive()
     {
         if (IsStardewValleyActive()) return true;
 
-        // Tìm tiến trình game
         Process[] processes = Process.GetProcesses();
         foreach (var proc in processes)
         {
@@ -265,12 +327,9 @@ class Program
                 IntPtr handle = proc.MainWindowHandle;
                 if (handle != IntPtr.Zero)
                 {
-                    // Khôi phục cửa sổ nếu bị thu nhỏ dưới Taskbar
                     ShowWindow(handle, SW_RESTORE);
-                    // Đưa lên vị trí Foreground hàng đầu
                     SetForegroundWindow(handle);
-
-                    Thread.Sleep(150); // Chờ một chút ngắn để Windows chuyển cảnh mượt mà
+                    Thread.Sleep(150);
                     return true;
                 }
             }
